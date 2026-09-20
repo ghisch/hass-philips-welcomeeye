@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/ghisch/hass-philips-welcomeeye/main/brands/icon.png" alt="" width="96" align="right">
+
 # Philips WelcomeEye for Home Assistant
 
 Local control of a Philips WelcomeEye / CFI Extel video intercom — gate and camera —
