@@ -157,19 +157,49 @@ def enc_login_frame(gid, user, pwd, chan=0, ver=5, b64=APP_B64, b65=APP_B65,
                 enc_login_tlv(gid, user, pwd, chan, b64, b65, login_id, mask_lo))
 
 # ---------------- discovery ----------------
-def discover(target="255.255.255.255", timeout=3.0, gid=b""):
+def discover(target="255.255.255.255", timeout=6.0, gid=b"", retry_every=1.0):
+    """Probe for devices on UDP 1500.
+
+    The probe is repeated rather than sent once: it is a single UDP datagram and
+    losing it means a failed setup for no good reason.
+
+    Note the device answers from an EPHEMERAL source port, not from 1500. The
+    socket is therefore left unconnected so it accepts a reply from any source -
+    and any NAT in the path will drop that reply, because it does not match the
+    flow that went out. That is why discovery does not survive a routed or VPN
+    path even when the device is perfectly reachable.
+    """
     pkt = tlv(0xA007, gid.ljust(32, b"\x00"))
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    s.settimeout(timeout); s.bind(("0.0.0.0", 0))
-    s.sendto(pkt, (target, 1500))
-    found = []; t0 = time.time()
-    while time.time()-t0 < timeout:
-        try: d, a = s.recvfrom(4096)
-        except socket.timeout: break
+    s.settimeout(0.5)
+    s.bind(("0.0.0.0", 0))
+    single = target not in ("255.255.255.255", "<broadcast>")
+    found, seen = [], set()
+    deadline, last_probe = time.time() + timeout, 0.0
+    while time.time() < deadline:
+        if time.time() - last_probe >= retry_every:
+            try:
+                s.sendto(pkt, (target, 1500))
+            except OSError:
+                pass
+            last_probe = time.time()
+        try:
+            d, a = s.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except ConnectionRefusedError:
+            continue                      # ICMP unreachable from an earlier probe
         r = parse_discovery(d)
-        if r: r["from"] = a[0]; found.append(r)
-    s.close(); return found
+        if not r or r["gid"] in seen:
+            continue
+        seen.add(r["gid"])
+        r["from"] = a[0]
+        found.append(r)
+        if single:
+            break                         # asked about one device, and it answered
+    s.close()
+    return found
 
 def parse_discovery(d):
     if len(d) < 8: return None
