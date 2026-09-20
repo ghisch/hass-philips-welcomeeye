@@ -9,6 +9,8 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
+from homeassistant.helpers.selector import (NumberSelector, NumberSelectorConfig,
+                                            NumberSelectorMode)
 
 from .const import (CONF_AV_WAIT, CONF_GID, CONF_LOCK_CHANNEL, CONF_PASSWORD_IS_DERIVED,
                     CONF_PUNCH_PORT, DEFAULT_AV_WAIT, DEFAULT_USERNAME, DOMAIN,
@@ -145,8 +147,8 @@ class WelcomeEyeOptionsFlow(OptionsFlow):
         if user_input is not None:
             port = user_input.get(CONF_PUNCH_PORT) or 0
             return self.async_create_entry(data={
-                CONF_LOCK_CHANNEL: user_input[CONF_LOCK_CHANNEL],
-                CONF_AV_WAIT: user_input[CONF_AV_WAIT],
+                CONF_LOCK_CHANNEL: int(user_input[CONF_LOCK_CHANNEL]),
+                CONF_AV_WAIT: float(user_input[CONF_AV_WAIT]),
                 CONF_PUNCH_PORT: int(port) or None,
             })
 
@@ -156,12 +158,16 @@ class WelcomeEyeOptionsFlow(OptionsFlow):
             data_schema=vol.Schema({
                 vol.Required(CONF_LOCK_CHANNEL,
                              default=opts.get(CONF_LOCK_CHANNEL, LOCK_CHANNEL_GATE)):
-                    vol.All(vol.Coerce(int), vol.Range(min=0, max=7)),
+                    NumberSelector(NumberSelectorConfig(
+                        min=0, max=7, step=1, mode=NumberSelectorMode.BOX)),
                 vol.Required(CONF_AV_WAIT,
                              default=opts.get(CONF_AV_WAIT, DEFAULT_AV_WAIT)):
-                    vol.All(vol.Coerce(float), vol.Range(min=2, max=60)),
+                    NumberSelector(NumberSelectorConfig(
+                        min=1, max=60, step=0.5, mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="s")),
                 vol.Optional(CONF_PUNCH_PORT,
                              default=opts.get(CONF_PUNCH_PORT) or 0):
-                    vol.All(vol.Coerce(int), vol.Range(min=0, max=65535)),
+                    NumberSelector(NumberSelectorConfig(
+                        min=0, max=65535, step=1, mode=NumberSelectorMode.BOX)),
             }),
         )

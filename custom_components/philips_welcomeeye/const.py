@@ -29,5 +29,8 @@ CONF_PASSWORD_IS_DERIVED: Final = "password_is_derived"
 CONF_LOCK_CHANNEL: Final = "lock_channel"
 CONF_AV_WAIT: Final = "av_wait"
 
-#: Seconds to wait for door video before refusing to send an unlock.
-DEFAULT_AV_WAIT: Final = 10.0
+#: Seconds to wait for door video before refusing to send an unlock. This is a
+#: deadline, not a delay: the unlock fires the moment video arrives, which measured
+#: consistently at about 1.3 s. It only bounds how long a doomed attempt waits
+#: before failing, so a few seconds of headroom costs nothing on success.
+DEFAULT_AV_WAIT: Final = 5.0

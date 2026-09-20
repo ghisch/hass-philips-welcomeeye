@@ -29,6 +29,15 @@ touches the device until you enable it, and then only while something is watchin
 command and does nothing. The integration waits for door video and refuses to send
 otherwise, so a press either works or fails loudly.
 
+Because of the one-channel rule above, opening the gate has to borrow the door
+channel. It does that and gives it straight back: viewers are dropped for a couple
+of seconds and reconnect to whatever source was selected, and if the stream was off
+it stays off. Nothing you had set changes.
+
+The wait for video is a **deadline, not a delay** — the gate fires as soon as video
+arrives, about 1.3 s in testing. Lowering it does not make the gate open sooner, it
+only makes a doomed attempt give up faster. The default is 5 s.
+
 **There is no gate state to read.** The device has no relay of its own; it pulses an
 external gate controller, which toggles. Hence a button, not a cover — an optimistic
 open/closed entity would drift out of sync with the real gate.

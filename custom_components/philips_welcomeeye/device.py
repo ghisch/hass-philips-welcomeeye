@@ -112,6 +112,10 @@ class WelcomeEyeDevice:
 
         self._server: _TsServer | None = None
         self._lock = threading.Lock()
+        #: Set while an unlock is in flight. Viewers stop and new ones are refused,
+        #: because the unlock needs the door channel and the device only serves one.
+        self._unlocking = threading.Event()
+        self._unlock_lock = threading.Lock()
 
     # ------------------------------------------------------------------ session
     def _connect_once(self, channel_key: str, port: int | None) -> tuple[UdtSession, dict]:
@@ -200,10 +204,35 @@ class WelcomeEyeDevice:
     def unlock(self) -> dict[str, object]:
         """Open the gate. Blocking, and it physically moves the gate.
 
+        Borrows the door channel for the duration and gives it straight back. The
+        device serves one channel at a time, so an unlock attempted while something
+        is watching the second camera would get no door video and be refused. Any
+        viewers are therefore dropped first, new ones are held off, and afterwards
+        the configured channel is untouched so they reconnect exactly where they
+        were - or stay off, if streaming was off to begin with.
+
         Refuses unless door video is actually flowing: without it the device
         answers result=1 and does nothing, which would otherwise be reported as
         success.
         """
+        with self._unlock_lock:
+            self._unlocking.set()
+            try:
+                self._wait_for_viewers_to_release()
+                return self._unlock_locked()
+            finally:
+                # nothing to restore: the channel selection was never changed, so
+                # viewers reconnecting land back on whatever is configured
+                self._unlocking.clear()
+
+    def _wait_for_viewers_to_release(self, timeout: float = 4.0) -> None:
+        """Let current viewers notice they have been stopped and close their
+        sessions, so the channel is free."""
+        deadline = time.time() + timeout
+        while self.stats.clients > 0 and time.time() < deadline:
+            time.sleep(0.1)
+
+    def _unlock_locked(self) -> dict[str, object]:
         session, _res = self._session(CHANNEL_DOOR)
         try:
             self._start_av(session, CHANNEL_DOOR)
@@ -302,7 +331,7 @@ class _Handler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:  # noqa: D102
         device: WelcomeEyeDevice = self.server.device  # type: ignore[attr-defined]
-        if not device.stream_enabled:
+        if not device.stream_enabled or device._unlocking.is_set():
             return
         stop = threading.Event()
         device.stats.clients += 1
@@ -310,8 +339,12 @@ class _Handler(socketserver.BaseRequestHandler):
         def write(data: bytes) -> None:
             self.request.sendall(data)
 
+        def should_stop() -> bool:
+            # yield the channel the moment the gate needs it
+            return stop.is_set() or device._unlocking.is_set()
+
         try:
-            device.pump_to(write, stop.is_set)
+            device.pump_to(write, should_stop)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass                       # viewer went away, which is the normal exit
         except Exception as err:       # noqa: BLE001 - surfaced as a diagnostic

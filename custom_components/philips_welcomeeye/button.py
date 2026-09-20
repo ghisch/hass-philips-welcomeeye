@@ -38,6 +38,12 @@ class GateButton(WelcomeEyeEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Open the gate.
 
+        Borrows the door channel and gives it straight back: any viewers are
+        dropped for a couple of seconds and reconnect to whatever was selected
+        before, and if streaming was off it stays off. The device serves one
+        channel at a time, so without this an unlock during a second-camera view
+        would simply be ignored.
+
         The device answers result=1 whether or not the relay fired, so the device
         layer refuses to send unless door video is actually flowing. A failure here
         is a real failure and is surfaced rather than swallowed.
