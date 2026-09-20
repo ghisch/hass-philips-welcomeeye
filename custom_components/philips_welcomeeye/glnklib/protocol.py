@@ -347,9 +347,11 @@ class UdtSession:
             d = discover(ip, timeout=3.0)
             if not d:
                 raise RuntimeError(
-                    f"no discovery reply from {ip}. Discovery does not cross some "
-                    f"routed/VPN paths. Run `cli.py findport --ip {ip}` and pass "
-                    f"--punch-port, or set GLNK_PUNCH_PORT in .env")
+                    f"{ip} did not answer a discovery probe on UDP 1500. The UDT "
+                    f"port is randomised and rotates, so discovery is the only way "
+                    f"to learn it. Check that the device is powered on, that it is "
+                    f"on the same subnet as Home Assistant, and that nothing "
+                    f"between them blocks UDP 1500.")
             port = d[0]["port2"]
         self.ip, self.gid, self.port = ip, gid, port
         self.c = UdtClient(ip, port, verbose=verbose)
