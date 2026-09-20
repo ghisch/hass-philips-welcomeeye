@@ -1,0 +1,74 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Philips WelcomeEye",
+        "description": "Pick the intercom to add. Discovery is a UDP broadcast, so a device on another subnet or across a VPN will not appear here — add it manually instead.",
+        "data": { "device": "Device" }
+      },
+      "manual": {
+        "title": "Enter the intercom details",
+        "description": "The device id (GID) is printed in the app under device information, and looks like cgab12cd34.",
+        "data": { "host": "Host", "gid": "Device id (GID)" }
+      },
+      "credentials": {
+        "title": "Sign in to {gid}",
+        "description": "Use the same credentials as the WelcomeEye app.",
+        "data": {
+          "username": "Username",
+          "password": "Password",
+          "password_is_derived": "This password is already in the device's derived form"
+        },
+        "data_description": {
+          "password_is_derived": "Leave this off unless you recovered the 8-character derived password rather than the one you type into the app."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the intercom. Check the address, and note that the UDT port is randomised — discovery must be able to reach the device.",
+      "invalid_auth": "The device rejected these credentials.",
+      "required": "This field is required."
+    },
+    "abort": { "already_configured": "This intercom is already set up." }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "WelcomeEye options",
+        "data": {
+          "lock_channel": "Gate relay channel",
+          "av_wait": "Seconds to wait for video before opening",
+          "punch_port": "Fixed UDT port (0 = discover)"
+        },
+        "data_description": {
+          "lock_channel": "Which relay the gate is wired to. 1 on the units seen so far; 0 is the door strike.",
+          "av_wait": "The device ignores an unlock unless door video is live, so the gate button waits for it first.",
+          "punch_port": "Only for paths where discovery cannot reach the device. The port is randomised and rotates, so a fixed value will eventually stop working."
+        }
+      }
+    }
+  },
+  "entity": {
+    "button": { "gate": { "name": "Gate" } },
+    "camera": { "camera": { "name": "Camera" } },
+    "switch": { "stream": { "name": "Stream" } },
+    "select": {
+      "channel": {
+        "name": "Camera source",
+        "state": { "door": "Door station", "cam": "Second camera" }
+      }
+    },
+    "sensor": {
+      "clock_skew": { "name": "Clock offset" },
+      "punch_port": { "name": "UDT port" },
+      "model": { "name": "Model" },
+      "stream_clients": { "name": "Stream viewers" },
+      "stream_frames": { "name": "Frames streamed" },
+      "last_gate_open": { "name": "Last gate command" },
+      "last_stream_error": { "name": "Last stream error" }
+    }
+  },
+  "exceptions": {
+    "no_video": { "message": "The device will ignore an unlock without live door video." }
+  }
+}
