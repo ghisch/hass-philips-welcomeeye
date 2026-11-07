@@ -73,6 +73,20 @@ the door stream is running, and opens a short one of its own otherwise. Discover
 sends at most three probes, three seconds apart, and backs off for 30 seconds after
 a failure.
 
+Turning the stream switch off also stops Home Assistant's own stream worker. Left
+running, that worker retries the refused port, and its wait grows by ten seconds
+per attempt. The next preview after the switch goes back on then waits for that
+timer, up to a minute or two. A reload costs more: a session that lasted only
+seconds makes the device ignore discovery for about 100 seconds, and setup waits
+that out.
+
+Every session end is logged with its reason: the last viewer hung up, streaming was
+switched off, the camera source changed, the gate needs the door channel, the
+integration is unloading, the device closed the session, or no packet from the
+device for 15 s. When a stream looks broken, that line says who ended it. In 35
+minutes of switching sources, toggling and reloading on 2026-11-07, the device
+closed none.
+
 ## Installation
 
 1. HACS → three-dot menu → **Custom repositories**, add this repository as an

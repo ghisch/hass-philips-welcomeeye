@@ -40,10 +40,33 @@ class WelcomeEyeCamera(WelcomeEyeEntity, Camera):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         self._device.on_channel_change = lambda: self.hass.add_job(self._async_restart_stream)
+        self._device.on_stream_enabled_change = (
+            lambda enabled: self.hass.add_job(self._async_stream_enabled_changed, enabled))
 
     async def async_will_remove_from_hass(self) -> None:
         self._device.on_channel_change = None
+        self._device.on_stream_enabled_change = None
+        # Home Assistant does not stop a camera's stream worker when the entity
+        # goes; left alone it retries the old loopback port for good
+        await self._async_stop_stream()
         await super().async_will_remove_from_hass()
+
+    async def _async_stream_enabled_changed(self, enabled: bool) -> None:
+        """The switch moved. Off: stop the worker. Left running it retries the
+        refused port with a back-off that grows by ten seconds per attempt, and
+        the next preview then waits for that timer instead of starting at once.
+        """
+        if not enabled:
+            await self._async_stop_stream()
+        self.async_write_ha_state()
+
+    async def _async_stop_stream(self) -> None:
+        if self.stream is None:
+            return
+        try:
+            await self.stream.stop()
+        except Exception as err:  # noqa: BLE001 - best effort
+            _LOGGER.debug("could not stop the stream: %s", err)
 
     async def _async_restart_stream(self) -> None:
         """The source changed under a running stream: make the worker reconnect

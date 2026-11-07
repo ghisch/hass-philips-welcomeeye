@@ -418,6 +418,7 @@ class UdtSession:
         self._dev_time = None      # device clock at login
         self._dev_t0 = None        # local monotonic at that moment
         self.login_frames = []     # every TLV that arrived with the login reply
+        self.end_reason = None     # why messages() last returned, for the caller's log
 
     # -------------------------------------------------------------- transport
     def _ctrl_packet(self, w0, w1):
@@ -431,12 +432,13 @@ class UdtSession:
         elif ct == T_SHUTDOWN:
             if self.verbose:
                 print("  [udt] peer shutdown")
+            self.end_reason = "the device closed the session"
             return True
         elif ct == T_NAK and self.verbose:
             print("  [udt] NAK")
         return False
 
-    def messages(self, secs, ack_every=0.01):
+    def messages(self, secs, ack_every=0.01, should_stop=None, silence=None):
         """Yield complete UDT messages for `secs`, answering control traffic.
 
         UDT is message oriented: the FF bits say solo (3), first (2), middle (0),
@@ -446,16 +448,29 @@ class UdtSession:
         ACKs are rate limited to `ack_every` rather than sent per packet; UDT's own
         model is a periodic ACK timer, and one ACK per data packet doubles our
         outbound packet rate for nothing.
+
+        `should_stop()` is polled while nothing arrives, so a caller can end a
+        session the device went quiet on; `silence` ends one after that many
+        seconds without a packet. `end_reason` says which happened.
         """
         import socket as _s
         from .udt import CTRL, T_ACK
         end = time.time() + secs
         last_ack, last_seq = 0.0, 0
+        last_rx = time.time()
+        self.end_reason = None
         while time.time() < end:
             try:
                 pkt, _a = self.c.sock.recvfrom(65536)
             except _s.timeout:
+                if should_stop is not None and should_stop():
+                    self.end_reason = "stopped"
+                    return
+                if silence is not None and time.time() - last_rx > silence:
+                    self.end_reason = f"no packet from the device for {silence:.0f}s"
+                    return
                 continue
+            last_rx = time.time()
             if len(pkt) < 16:
                 continue
             w0, w1, _ts, _dst = struct.unpack_from(">IIII", pkt, 0)

@@ -43,6 +43,9 @@ PRIV_INFO_TLV = 469          # asking this returns the device's version JSON
 
 #: how long to wait for door video before deciding an unlock cannot work
 AV_WAIT_SECONDS = 10.0
+#: a streaming session with no packet at all for this long is dead; the
+#: device never goes quiet while it serves video
+SILENCE_SECONDS = 15.0
 
 #: The quiet spells were self-inflicted. Left alone, the device answers every
 #: discovery probe: 180 of 180 over three minutes with the integration disabled.
@@ -173,6 +176,8 @@ class WelcomeEyeDevice:
         #: Called after the camera source changed, so the camera entity can make
         #: Home Assistant restart its stream at once instead of on its own retry.
         self.on_channel_change: object = None
+        #: called with True/False when the stream switch moves
+        self.on_stream_enabled_change = None
         #: Set after a discovery failure. Until it passes, session attempts fail
         #: at once instead of probing again - Home Assistant retries a camera
         #: stream every few seconds, and each retry must not cost the device.
@@ -430,11 +435,16 @@ class WelcomeEyeDevice:
                 self._server = None
 
     def set_stream_enabled(self, enabled: bool) -> None:
+        if enabled == self.stream_enabled:
+            return
         self.stream_enabled = enabled
+        _LOGGER.info("streaming switched %s", "on" if enabled else "off")
         if not enabled:
-            self._drop_viewers()
+            self._drop_viewers("streaming was switched off")
+        if callable(self.on_stream_enabled_change):
+            self.on_stream_enabled_change(enabled)
 
-    def _drop_viewers(self) -> None:
+    def _drop_viewers(self, reason: str) -> None:
         """End the device session but keep the listening port.
 
         Home Assistant's stream worker remembers the URL it was given and keeps
@@ -444,7 +454,7 @@ class WelcomeEyeDevice:
         """
         with self._lock:
             if self._server is not None:
-                self._server.drop_viewers(join=True)
+                self._server.drop_viewers(reason, join=True)
 
     def set_channel(self, channel: str) -> None:
         if channel not in CHANNEL_MAP:
@@ -455,7 +465,7 @@ class WelcomeEyeDevice:
         _LOGGER.info("camera source -> %s", channel)
         # end the old session first - the device serves one channel at a time and
         # the incumbent keeps it - then let viewers reconnect to the SAME port
-        self._drop_viewers()
+        self._drop_viewers("the camera source changed")
         if callable(self.on_channel_change):
             self.on_channel_change()
 
@@ -472,12 +482,14 @@ class WelcomeEyeDevice:
         session, _res = self._session(channel_key)
         with self._live_lock:
             self._live, self._live_channel = session, channel_key
+        frames0 = self.stats.frames
         try:
             self._start_av(session, channel_key)
             started, ts0 = False, None
             self.stats.started_at = time.time()
             _LOGGER.info("stream: session up on %s, waiting for a keyframe", channel_key)
-            for msg in session.messages(1e9):
+            for msg in session.messages(1e9, should_stop=should_stop,
+                                        silence=SILENCE_SECONDS):
                 if should_stop():
                     break
                 kind, payload, ts_ms = _media(msg)
@@ -507,8 +519,11 @@ class WelcomeEyeDevice:
             with self._live_lock:
                 self._live, self._live_channel = None, None
             self.stats.streaming = False
-            _LOGGER.info("stream: session on %s closed after %d frames",
-                         channel_key, self.stats.frames)
+            # should_stop() names its reason; otherwise the session knows why
+            # its message loop returned
+            reason = should_stop() or session.end_reason or "the session ended"
+            _LOGGER.info("stream: session on %s ended after %d frames: %s",
+                         channel_key, self.stats.frames - frames0, reason)
             session.close()
 
 
@@ -531,6 +546,9 @@ class _Handler(socketserver.BaseRequestHandler):
         server: _TsServer = self.server  # type: ignore[assignment]
         device = server.device
         if not device.stream_enabled or device._unlocking.is_set():
+            _LOGGER.debug("stream: viewer refused (%s)",
+                          "streaming is switched off" if not device.stream_enabled
+                          else "the gate is using the device")
             return
         viewer = server.add_viewer(self.request)
         self.request.settimeout(1.0)
@@ -564,6 +582,7 @@ class _TsServer(socketserver.ThreadingTCPServer):
         self._vlock = threading.Lock()
         self._pump: threading.Thread | None = None
         self._stopping = False
+        self._drop_reason = ""           # why the viewers were last let go
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -597,6 +616,7 @@ class _TsServer(socketserver.ThreadingTCPServer):
         viewer = _Viewer(sock)
         with self._vlock:
             self._viewers.append(viewer)
+            self._drop_reason = ""
             self.device.stats.clients = len(self._viewers)
             _LOGGER.info("stream: viewer connected (%d now)", len(self._viewers))
             if self._pump is None or not self._pump.is_alive():
@@ -609,21 +629,25 @@ class _TsServer(socketserver.ThreadingTCPServer):
         with self._vlock:
             if viewer in self._viewers:
                 self._viewers.remove(viewer)
+                if not self._viewers and not self._drop_reason:
+                    self._drop_reason = "the last viewer hung up"
             viewer.gone.set()
             self.device.stats.clients = len(self._viewers)
             _LOGGER.info("stream: viewer gone (%d left)", len(self._viewers))
 
-    def _drop_all(self) -> None:
-        """The session died: let every viewer go so Home Assistant reconnects."""
+    def _drop_all(self, reason: str) -> None:
+        """Let every viewer go so Home Assistant reconnects; `reason` is what
+        the pump then logs."""
         with self._vlock:
+            self._drop_reason = reason
             for v in self._viewers:
                 v.gone.set()
             self._viewers.clear()
             self.device.stats.clients = 0
 
-    def drop_viewers(self, join: bool = False) -> None:
+    def drop_viewers(self, reason: str, join: bool = False) -> None:
         """Disconnect every viewer and end the session; keep listening."""
-        self._drop_all()
+        self._drop_all(reason)
         pump = self._pump
         if join and pump is not None and pump.is_alive() \
                 and pump is not threading.current_thread():
@@ -632,10 +656,16 @@ class _TsServer(socketserver.ThreadingTCPServer):
                 _LOGGER.warning("stream: previous session did not close in time")
 
     # ------------------------------------------------------------------ pump
-    def _should_stop(self) -> bool:
+    def _should_stop(self) -> str:
+        """Why the pump must end now, or "" to keep going."""
+        if self._stopping:
+            return "the integration is unloading"
+        if self.device._unlocking.is_set():
+            return "the gate needs the door channel"
         with self._vlock:
-            empty = not self._viewers
-        return empty or self._stopping or self.device._unlocking.is_set()
+            if not self._viewers:
+                return self._drop_reason or "the last viewer hung up"
+        return ""
 
     def _on_frame(self, payload, pts: int, keyframe: bool) -> None:
         with self._vlock:
@@ -661,7 +691,7 @@ class _TsServer(socketserver.ThreadingTCPServer):
             self.device.stats.last_error = str(err)
             _LOGGER.warning("stream failed: %s", err)
         finally:
-            self._drop_all()
+            self._drop_all("the session ended")
 
 
 def locate_punch_port(host: str) -> list[int]:
