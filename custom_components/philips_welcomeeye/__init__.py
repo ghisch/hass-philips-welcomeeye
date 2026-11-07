@@ -66,12 +66,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: WelcomeEyeConfigEntry) -
     device.on_port_change = _port_changed
 
     try:
-        await hass.async_add_executor_job(device.probe)
+        info = await hass.async_add_executor_job(device.discover_only)
     except WelcomeEyeError as err:
         raise ConfigEntryNotReady(f"cannot reach the intercom: {err}") from err
 
+    # No login at setup, on purpose: a login consumes the port discovery just
+    # handed out and locks discovery out for about 100 seconds. The first real
+    # session is whatever the user asks for next. The coordinator starts from
+    # what discovery gave us and fills the rest in at its first poll.
     coordinator = WelcomeEyeCoordinator(hass, device)
-    await coordinator.async_config_entry_first_refresh()
+    coordinator.async_set_updated_data(info)
     entry.runtime_data = WelcomeEyeData(device=device, coordinator=coordinator,
                                         options=dict(entry.options))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

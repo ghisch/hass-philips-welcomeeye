@@ -30,7 +30,7 @@ from .glnklib.commands import (AV_CAM, AV_DOOR, TLV_LOCK_REQ_ENC, TLV_PRIVATE_RE
                                TLV_START_AV_ENC, lock_body, parse_lock_rsp, priv_body,
                                start_av_body, unwrap_priv_rsp, wrap_priv, wrap_cmd)
 from .glnklib.protocol import (CH_CAM, CH_DOOR, RESULT_CODES, UdtSession, discover,
-                               find_punch_port, tlv)
+                               find_punch_port, parse_owsp, tlv)
 from .glnklib.tsmux import TsMuxer
 
 _LOGGER = logging.getLogger(__name__)
@@ -64,6 +64,21 @@ PORT_REUSE_SECONDS = 20.0
 #: A burst of handshakes to a dead port right before a probe seemed to cost the
 #: probe its reply. A short pause between the two is cheap insurance.
 SETTLE_AFTER_FAILED_HANDSHAKE = 1.5
+
+#: What the device actually does, read off a full debug log:
+#:
+#:   discovery hands a client ONE port, and keeps re-advertising the same one
+#:   for as long as nobody uses it (20 probes, one port, all answered);
+#:   a session on that port consumes it - a second login still works for a few
+#:   seconds, then the port stops answering;
+#:   and from that session until roughly 100 seconds later, discovery from the
+#:   same client gets no reply at all. Three times in one log: answers at
+#:   22:47:04, 22:48:43 and 22:50:28, silence in between, with a session having
+#:   been opened after each answer.
+#:
+#: So every session costs about 100 seconds of lockout. The design here opens as
+#: few as it can: setup only discovers, the stream is one shared session, and
+#: the gate rides on the live stream session when there is one.
 
 
 class WelcomeEyeError(Exception):
@@ -146,6 +161,13 @@ class WelcomeEyeDevice:
         #: One session setup at a time. Several stream viewers arriving together
         #: must not each run their own discovery.
         self._session_lock = threading.Lock()
+        #: The stream's session while frames are flowing, so the gate can use it
+        #: instead of paying for a session of its own.
+        self._live: UdtSession | None = None
+        self._live_channel: str | None = None
+        self._live_lock = threading.Lock()
+        self._lock_rsp: dict | None = None
+        self._lock_rsp_event = threading.Event()
         #: Called with a new port so it can be persisted. Set by the integration.
         self.on_port_change: object = None
         #: Set after a discovery failure. Until it passes, session attempts fail
@@ -210,7 +232,7 @@ class WelcomeEyeDevice:
                     f"not probing the device again for {remaining:.0f}s after the "
                     f"last discovery failure, so repeated retries cannot starve it")
             port = self.fixed_port
-            age = time.time() - self._port_time
+            age = (time.time() - self._port_time) if self._port_time else float("inf")
             if port is None and self.punch_port is not None and age < PORT_REUSE_SECONDS:
                 port = self.punch_port
             if port is not None:
@@ -225,8 +247,9 @@ class WelcomeEyeDevice:
                                     port, age, err)
                     time.sleep(SETTLE_AFTER_FAILED_HANDSHAKE)
             elif self.punch_port is not None:
-                _LOGGER.debug("session on %s: port %s is %.0fs old, discovering afresh",
-                              channel_key, self.punch_port, age)
+                _LOGGER.debug("session on %s: port %s is %s, discovering afresh",
+                              channel_key, self.punch_port,
+                              "of unknown age" if age == float("inf") else f"{age:.0f}s old")
             try:
                 port = self._discover_port(discover_window)
             except WelcomeEyeError:
@@ -243,6 +266,23 @@ class WelcomeEyeDevice:
                                   TLV_START_AV_ENC))
 
     # -------------------------------------------------------------- operations
+    def discover_only(self) -> dict[str, object]:
+        """Find the device without logging in. Blocking.
+
+        Discovery keeps re-advertising an unused port; a login consumes it and
+        locks discovery out for about 100 seconds. Setup therefore stops here, and
+        the first session is whatever the user asks for next - which then gets a
+        port that is still fresh.
+        """
+        with self._session_lock:
+            port = self.fixed_port or self._discover_port(DISCOVERY_WINDOW_LONG)
+            self.punch_port = port
+        info: dict[str, object] = {"punch_port": port}
+        if self.info:
+            info = {**self.info, **info}
+        self.info = info
+        return info
+
     def probe(self) -> dict[str, object]:
         """Log in and collect what the device volunteers. Blocking."""
         session, res = self._session(self.channel,
@@ -298,6 +338,14 @@ class WelcomeEyeDevice:
         success.
         """
         with self._unlock_lock:
+            with self._live_lock:
+                live = self._live if (self._live_channel == CHANNEL_DOOR
+                                      and self.stats.streaming) else None
+            if live is not None:
+                # door video is already flowing on this session: that is the
+                # precondition, and no new session means no 100 s lockout
+                _LOGGER.info("gate: using the live door stream session")
+                return self._send_lock(live)
             self._unlocking.set()
             try:
                 self._wait_for_viewers_to_release()
@@ -306,6 +354,19 @@ class WelcomeEyeDevice:
                 # nothing to restore: the channel selection was never changed, so
                 # viewers reconnecting land back on whatever is configured
                 self._unlocking.clear()
+
+    def _send_lock(self, session: UdtSession) -> dict[str, object]:
+        """Send TLV 505 on a session whose message loop runs elsewhere, and wait
+        for the 506 that loop hands back."""
+        self._lock_rsp, self._lock_rsp_event = None, threading.Event()
+        body = lock_body(self._password, channel=self.lock_channel, action=1,
+                         delay=0, dev_time=session.device_now())
+        session.send_tlv(TLV_LOCK_REQ_ENC, wrap_cmd(self.gid, body, TLV_LOCK_REQ_ENC))
+        result: dict[str, object] = {"acknowledged": False, "at": time.time()}
+        if self._lock_rsp_event.wait(8.0) and self._lock_rsp:
+            result.update(acknowledged=True, **self._lock_rsp)
+        self.last_unlock = result
+        return result
 
     def _wait_for_viewers_to_release(self, timeout: float = 4.0) -> None:
         """Let current viewers notice they have been stopped and close their
@@ -390,6 +451,8 @@ class WelcomeEyeDevice:
         """
         channel_key = self.channel
         session, _res = self._session(channel_key)
+        with self._live_lock:
+            self._live, self._live_channel = session, channel_key
         try:
             self._start_av(session, channel_key)
             started, ts0 = False, None
@@ -399,6 +462,14 @@ class WelcomeEyeDevice:
                 if should_stop():
                     break
                 kind, payload, ts_ms = _media(msg)
+                if kind is None:
+                    # not media: the gate's reply arrives here when it used this session
+                    for _flag, tlv_type, value in parse_owsp(msg)[0]:
+                        if tlv_type == 506:
+                            rsp = parse_lock_rsp(self.gid, value)
+                            self._lock_rsp = {"result": rsp["result"], "extra": rsp["extra"]}
+                            self._lock_rsp_event.set()
+                    continue
                 if kind not in ("key", "inter"):
                     continue
                 if not started:
@@ -414,6 +485,8 @@ class WelcomeEyeDevice:
                 self.stats.frames += 1
                 self.stats.bytes_sent += len(payload)
         finally:
+            with self._live_lock:
+                self._live, self._live_channel = None, None
             self.stats.streaming = False
             _LOGGER.info("stream: session on %s closed after %d frames",
                          channel_key, self.stats.frames)
