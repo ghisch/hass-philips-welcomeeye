@@ -437,7 +437,9 @@ class WelcomeEyeDevice:
         if channel == self.channel:
             return
         self.channel = channel
-        # drop the server so viewers reconnect onto the new channel
+        # drop the server so viewers reconnect onto the new channel; stop() waits
+        # for the old session to close first, or the new channel gets no video
+        _LOGGER.info("camera source -> %s", channel)
         self.stop_stream_server()
 
     def pump_frames(self, on_frame, should_stop) -> None:
@@ -563,6 +565,15 @@ class _TsServer(socketserver.ThreadingTCPServer):
         self.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        # Wait for the device session to actually close. Switching camera source
+        # stops this server and starts a new one on the other channel; the device
+        # serves one channel at a time and the incumbent keeps it, so a new session
+        # opened while the old one is still winding down gets no video.
+        pump = self._pump
+        if pump is not None and pump.is_alive() and pump is not threading.current_thread():
+            pump.join(timeout=6)
+            if pump.is_alive():
+                _LOGGER.warning("stream: previous session did not close in time")
 
     # --------------------------------------------------------------- viewers
     def add_viewer(self, sock: socket.socket) -> _Viewer:
