@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from dataclasses import dataclass
@@ -47,17 +47,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: WelcomeEyeConfigEntry) -
     )
     device.av_wait = options.get(CONF_AV_WAIT, DEFAULT_AV_WAIT)
 
+    @callback
+    def _store_port(port: int) -> None:
+        if port != entry.data.get(CONF_LAST_PORT):
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_LAST_PORT: port})
+
+    def _port_changed(port: int) -> None:
+        # called from a worker thread, so hop back onto the loop
+        hass.add_job(_store_port, port)
+
+    device.on_port_change = _port_changed
+
     try:
         await hass.async_add_executor_job(device.probe)
     except WelcomeEyeError as err:
         raise ConfigEntryNotReady(f"cannot reach the intercom: {err}") from err
-
-    # Remember the port that worked. Discovery is a UDP broadcast and does not
-    # cross every network, so a restart that can reuse the last port is a restart
-    # that does not depend on one.
-    if device.punch_port and device.punch_port != entry.data.get(CONF_LAST_PORT):
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_LAST_PORT: device.punch_port})
 
     coordinator = WelcomeEyeCoordinator(hass, device)
     await coordinator.async_config_entry_first_refresh()

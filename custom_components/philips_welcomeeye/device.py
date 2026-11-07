@@ -44,10 +44,16 @@ PRIV_INFO_TLV = 469          # asking this returns the device's version JSON
 #: how long to wait for door video before deciding an unlock cannot work
 AV_WAIT_SECONDS = 10.0
 
-#: The device stops answering discovery for 10 to 15 seconds at a time. Measured by
-#: probing once a second for two minutes: twelve seconds of silence, then 84 replies
-#: in a row. A window shorter than that turns a normal quiet spell into a failure.
-DISCOVERY_WINDOW = 25.0
+#: The device stops answering discovery for long stretches. Probing once a second
+#: for four minutes from the Home Assistant host gave one unbroken 88 second
+#: silence, then replies for the rest. Any window shorter than that turns a normal
+#: quiet spell into a setup failure, which is exactly what was happening.
+#:
+#: Setup and the periodic refresh can afford to wait that out. A viewer cannot, so
+#: the stream uses a short window, fails fast, and relies on the refresh to have a
+#: usable port ready by the next attempt.
+DISCOVERY_WINDOW_LONG = 150.0
+DISCOVERY_WINDOW_SHORT = 20.0
 
 
 class WelcomeEyeError(Exception):
@@ -126,6 +132,8 @@ class WelcomeEyeDevice:
         #: One session setup at a time. Several stream viewers arriving together
         #: must not each run their own discovery.
         self._session_lock = threading.Lock()
+        #: Called with a new port so it can be persisted. Set by the integration.
+        self.on_port_change: object = None
 
     # ------------------------------------------------------------------ session
     def _connect_once(self, channel_key: str, port: int | None) -> tuple[UdtSession, dict]:
@@ -148,19 +156,24 @@ class WelcomeEyeDevice:
         self.punch_port = session.port
         return session, res
 
-    def _discover_port(self) -> int:
-        """Ask the device which UDT port to use, patiently."""
-        found = discover(self.host, timeout=DISCOVERY_WINDOW)
+    def _discover_port(self, window: float) -> int:
+        """Ask the device which UDT port to use."""
+        found = discover(self.host, timeout=window)
         if not found:
             raise WelcomeEyeError(
                 f"{self.host} did not answer a discovery probe on UDP 1500 within "
-                f"{DISCOVERY_WINDOW:.0f}s. The device stops answering for short "
-                f"spells, so this is usually transient. Check that it is powered "
-                f"on, on the same subnet as Home Assistant, and that nothing "
-                f"between them blocks UDP 1500.")
-        return found[0]["port2"]
+                f"{window:.0f}s. This device goes quiet for up to about 90 seconds "
+                f"at a time, so a single failure is usually nothing. If it never "
+                f"answers, check that it is powered on, on the same subnet as Home "
+                f"Assistant, and that nothing between them blocks UDP 1500.")
+        port = found[0]["port2"]
+        if port != self.punch_port and callable(self.on_port_change):
+            self.on_port_change(port)
+        return port
 
-    def _session(self, channel_key: str) -> tuple[UdtSession, dict]:
+    def _session(self, channel_key: str,
+                 discover_window: float = DISCOVERY_WINDOW_SHORT
+                 ) -> tuple[UdtSession, dict]:
         """Log in on the channel's own mask. Caller must close the session.
 
         A known port is tried before discovery, and that order matters. The port
@@ -178,7 +191,7 @@ class WelcomeEyeDevice:
                         raise       # the user pinned this port on purpose
                     _LOGGER.debug("punch port %s did not work (%s), rediscovering",
                                   port, err)
-            port = self._discover_port()
+            port = self._discover_port(discover_window)
             self.punch_port = port
             return self._connect_once(channel_key, port)
 
@@ -191,7 +204,8 @@ class WelcomeEyeDevice:
     # -------------------------------------------------------------- operations
     def probe(self) -> dict[str, object]:
         """Log in and collect what the device volunteers. Blocking."""
-        session, res = self._session(self.channel)
+        session, res = self._session(self.channel,
+                                     discover_window=DISCOVERY_WINDOW_LONG)
         try:
             info: dict[str, object] = {
                 "device_time": res.get("time"),
