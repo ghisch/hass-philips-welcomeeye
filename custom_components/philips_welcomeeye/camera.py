@@ -52,7 +52,8 @@ class WelcomeEyeCamera(WelcomeEyeEntity, Camera):
 
     @property
     def is_streaming(self) -> bool:
-        return self._device.stats.clients > 0
+        # a viewer connecting is not a stream; frames leaving is
+        return self._device.stats.streaming
 
     @property
     def available(self) -> bool:

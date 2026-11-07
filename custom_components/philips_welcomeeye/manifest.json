@@ -1,7 +1,7 @@
 {
   "domain": "philips_welcomeeye",
   "name": "Philips WelcomeEye",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "documentation": "https://github.com/ghisch/hass-philips-welcomeeye",
   "issue_tracker": "https://github.com/ghisch/hass-philips-welcomeeye/issues",
   "codeowners": [

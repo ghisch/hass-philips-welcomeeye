@@ -6,6 +6,7 @@ from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME, Platfor
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 
+import logging
 from dataclasses import dataclass
 
 from .const import (CONF_AV_WAIT, CONF_GID, CONF_LAST_PORT, CONF_LOCK_CHANNEL,
@@ -20,9 +21,14 @@ class WelcomeEyeData:
 
     device: WelcomeEyeDevice
     coordinator: WelcomeEyeCoordinator
+    #: the options this entry was set up with; a change here is a real reload,
+    #: a change to entry.data (the remembered port) is not
+    options: dict
 
 
 type WelcomeEyeConfigEntry = ConfigEntry[WelcomeEyeData]
+
+_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [
     Platform.BUTTON,
@@ -66,7 +72,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: WelcomeEyeConfigEntry) -
 
     coordinator = WelcomeEyeCoordinator(hass, device)
     await coordinator.async_config_entry_first_refresh()
-    entry.runtime_data = WelcomeEyeData(device=device, coordinator=coordinator)
+    entry.runtime_data = WelcomeEyeData(device=device, coordinator=coordinator,
+                                        options=dict(entry.options))
+    device.on_session_failure = lambda: hass.add_job(coordinator.async_request_refresh)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload))
     return True
@@ -81,4 +89,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: WelcomeEyeConfigEntry) 
 
 
 async def _async_reload(hass: HomeAssistant, entry: WelcomeEyeConfigEntry) -> None:
+    """Reload when the options change. Saving the remembered port also updates the
+    entry, and reloading for that tore the stream server down on every new port -
+    which is what looked like the integration crashing."""
+    data = entry.runtime_data
+    if data is not None and dict(entry.options) == data.options:
+        _LOGGER.debug("entry data updated (remembered port); not reloading")
+        return
     await hass.config_entries.async_reload(entry.entry_id)

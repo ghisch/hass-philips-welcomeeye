@@ -9,7 +9,9 @@ Handshake CIF (48 bytes): version, sockType, ISN, MSS, flightFlagSize, reqType,
 sockID, cookie, peerIP[16].  Cookie exchange: req=1/cookie=0 -> req=1/cookie=N ->
 req=-1/cookie=N -> req=-1 + the peer's socket id.
 """
-import socket, struct, time, random
+import logging, socket, struct, time, random
+
+_LOGGER = logging.getLogger(__name__)
 
 CTRL = 0x80000000
 # UDT4 control packet types (RFC draft / udt4 packet.h). Getting SHUTDOWN and ACK2
@@ -54,19 +56,23 @@ class UdtClient:
         return self._ctrl(T_HANDSHAKE, cif + _ipfield(self.ip), dest=dest)
 
     def _log(self, *a):
+        msg = " ".join(str(x) for x in a)
         if self.verbose:
-            print("  [udt]", *a, flush=True)
+            print("  [udt]", msg, flush=True)
+        _LOGGER.debug("[udt %s:%s] %s", self.ip, self.port, msg)
 
     # ---------------------------------------------------------------- connect
     def connect(self, timeout=8.0):
         deadline = time.time() + timeout
         cookie, stage = 0, 1
         last_send = 0.0
+        sends = 0
         while time.time() < deadline:
             if time.time() - last_send > 0.4:
                 self.sock.sendto(self._handshake(1 if stage == 1 else -1, cookie, dest=0),
                                  (self.ip, self.port))
                 last_send = time.time()
+                sends += 1
             try:
                 d, _a = self.sock.recvfrom(65536)
             except socket.timeout:
@@ -86,6 +92,8 @@ class UdtClient:
                 self.peer_sockid = psock & 0xFFFFFFFF
                 self._log(f"connected: peer sockid {self.peer_sockid:#x}")
                 return True
+        self._log(f"handshake timed out after {sends} sends, stage {stage} "
+                  f"(1 = no cookie reply yet, 2 = cookie received but no final ack)")
         return False
 
     # ------------------------------------------------------------------- data

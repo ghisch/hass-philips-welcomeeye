@@ -91,6 +91,8 @@ class StreamStats:
     """What the diagnostic sensors report about streaming."""
 
     clients: int = 0
+    #: true only while frames are actually being written to a viewer
+    streaming: bool = False
     frames: int = 0
     bytes_sent: int = 0
     started_at: float | None = None
@@ -134,6 +136,9 @@ class WelcomeEyeDevice:
         self._session_lock = threading.Lock()
         #: Called with a new port so it can be persisted. Set by the integration.
         self.on_port_change: object = None
+        #: Called when a session could not be opened, so the integration can
+        #: refresh the port now rather than at the next five-minute poll.
+        self.on_session_failure: object = None
 
     # ------------------------------------------------------------------ session
     def _connect_once(self, channel_key: str, port: int | None) -> tuple[UdtSession, dict]:
@@ -152,7 +157,8 @@ class WelcomeEyeDevice:
             code = res.get("result")
             if code is not None:
                 raise WelcomeEyeError(f"login rejected: {RESULT_CODES.get(code, code)}")
-            raise WelcomeEyeError(res.get("error", "no login response"))
+            raise WelcomeEyeError(f"{res.get('error', 'no login response')} on port {port}")
+        _LOGGER.debug("logged in on port %s, device time %s", session.port, res.get("time"))
         self.punch_port = session.port
         return session, res
 
@@ -184,15 +190,24 @@ class WelcomeEyeDevice:
         with self._session_lock:
             port = self.fixed_port or self.punch_port
             if port is not None:
+                _LOGGER.debug("session on %s: trying known port %s", channel_key, port)
                 try:
                     return self._connect_once(channel_key, port)
                 except WelcomeEyeError as err:
                     if port == self.fixed_port:
                         raise       # the user pinned this port on purpose
-                    _LOGGER.debug("punch port %s did not work (%s), rediscovering",
-                                  port, err)
-            port = self._discover_port(discover_window)
+                    # at WARNING on purpose: this is the step that decides whether
+                    # discovery (and its quiet spells) is needed at all
+                    _LOGGER.warning("known port %s failed (%s); rediscovering with a "
+                                    "%.0fs window", port, err, discover_window)
+            try:
+                port = self._discover_port(discover_window)
+            except WelcomeEyeError:
+                if callable(self.on_session_failure):
+                    self.on_session_failure()
+                raise
             self.punch_port = port
+            _LOGGER.info("session on %s: discovered port %s", channel_key, port)
             return self._connect_once(channel_key, port)
 
     def _start_av(self, session: UdtSession, channel_key: str) -> None:
@@ -347,6 +362,7 @@ class WelcomeEyeDevice:
             mux = TsMuxer(write)
             started, ts0 = False, None
             self.stats.started_at = time.time()
+            _LOGGER.info("stream: session up on %s, waiting for a keyframe", channel_key)
             for msg in session.messages(1e9):
                 if should_stop():
                     break
@@ -357,6 +373,8 @@ class WelcomeEyeDevice:
                     if kind != "key":
                         continue          # never hand a decoder a mid-GOP start
                     started = True
+                    self.stats.streaming = True
+                    _LOGGER.info("stream: first keyframe, frames are flowing")
                 if ts0 is None:
                     ts0 = ts_ms if ts_ms is not None else 0
                 pts = ((ts_ms - ts0) if ts_ms is not None else 0) * 90
@@ -364,6 +382,9 @@ class WelcomeEyeDevice:
                 self.stats.frames += 1
                 self.stats.bytes_sent += len(payload)
         finally:
+            self.stats.streaming = False
+            _LOGGER.info("stream: session on %s closed after %d frames",
+                         channel_key, self.stats.frames)
             session.close()
 
 
@@ -376,6 +397,8 @@ class _Handler(socketserver.BaseRequestHandler):
             return
         stop = threading.Event()
         device.stats.clients += 1
+        _LOGGER.info("stream: viewer connected from %s (%d now)",
+                     self.client_address[0], device.stats.clients)
 
         def write(data: bytes) -> None:
             self.request.sendall(data)
@@ -394,6 +417,7 @@ class _Handler(socketserver.BaseRequestHandler):
         finally:
             stop.set()
             device.stats.clients = max(0, device.stats.clients - 1)
+            _LOGGER.info("stream: viewer gone (%d left)", device.stats.clients)
 
 
 class _TsServer(socketserver.ThreadingTCPServer):
