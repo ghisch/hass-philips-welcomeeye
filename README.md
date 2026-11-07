@@ -46,12 +46,30 @@ open/closed entity would drift out of sync with the real gate.
 
 ## Requirements
 
-Home Assistant must be able to reach the intercom by **UDP broadcast**, because the
-UDT port is randomised and rotates often — in testing it moved twice in one evening.
-Discovery is the only practical way to learn the current one. In practice this means
-Home Assistant on the same LAN as the intercom. Across a VPN or a routed subnet the
-broadcast does not arrive, and the fixed-port option in the integration's settings is
-a stopgap that will stop working the next time the port changes.
+Home Assistant must be on the **same LAN** as the intercom. The device answers a
+discovery probe from an ephemeral source port, so the reply does not survive NAT: a
+VPN, a routed subnet, or a container on a bridge network will not see it. The
+fixed-port option in the settings exists for that case, but ports on this device are
+allocated per client and short-lived, so it is a stopgap at best.
+
+## How the device behaves, and what the integration does about it
+
+These were measured, not assumed, and they explain most of the design:
+
+- **One session per port, and a port is consumed by use.** Discovery hands a client
+  one port and keeps re-advertising it while it is unused. After a login, a second
+  login on that port works for a few seconds, then the port stops answering.
+- **After some sessions, discovery ignores the client for about 100 seconds.** Seen
+  repeatedly after short login-and-close sessions. A long stream session that ended
+  cleanly did *not* trigger it. The exact rule is not known.
+- **Left alone, it answers every probe.** 180 of 180 over three minutes. Probing it
+  once a second makes it go quiet for about 90 seconds at a time.
+
+So the integration opens as few sessions as it can. Setup only discovers. One device
+session serves every viewer of the camera. The gate uses the live stream session when
+the door stream is running, and opens a short one of its own otherwise. Discovery
+sends at most three probes, three seconds apart, and backs off for 30 seconds after
+a failure.
 
 ## Installation
 
