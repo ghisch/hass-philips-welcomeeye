@@ -44,16 +44,17 @@ PRIV_INFO_TLV = 469          # asking this returns the device's version JSON
 #: how long to wait for door video before deciding an unlock cannot work
 AV_WAIT_SECONDS = 10.0
 
-#: The device stops answering discovery for long stretches. Probing once a second
-#: for four minutes from the Home Assistant host gave one unbroken 88 second
-#: silence, then replies for the rest. Any window shorter than that turns a normal
-#: quiet spell into a setup failure, which is exactly what was happening.
+#: The quiet spells were self-inflicted. Left alone, the device answers every
+#: discovery probe: 180 of 180 over three minutes with the integration disabled.
+#: Probed once a second - which a 25 to 150 second retry window amounts to - it
+#: stops answering for about 90 seconds at a time, and each reply allocates a
+#: fresh UDT port on the device that then dies within a minute under that churn.
 #:
-#: Setup and the periodic refresh can afford to wait that out. A viewer cannot, so
-#: the stream uses a short window, fails fast, and relies on the refresh to have a
-#: usable port ready by the next attempt.
-DISCOVERY_WINDOW_LONG = 150.0
-DISCOVERY_WINDOW_SHORT = 20.0
+#: So: a few spaced probes right before connecting, never a window, and a pause
+#: after any failure so Home Assistant's own retries cannot turn into a hammer.
+DISCOVERY_WINDOW_LONG = 9.0
+DISCOVERY_WINDOW_SHORT = 9.0
+FAILURE_BACKOFF = 30.0
 
 
 class WelcomeEyeError(Exception):
@@ -136,9 +137,10 @@ class WelcomeEyeDevice:
         self._session_lock = threading.Lock()
         #: Called with a new port so it can be persisted. Set by the integration.
         self.on_port_change: object = None
-        #: Called when a session could not be opened, so the integration can
-        #: refresh the port now rather than at the next five-minute poll.
-        self.on_session_failure: object = None
+        #: Set after a discovery failure. Until it passes, session attempts fail
+        #: at once instead of probing again - Home Assistant retries a camera
+        #: stream every few seconds, and each retry must not cost the device.
+        self._backoff_until: float = 0.0
 
     # ------------------------------------------------------------------ session
     def _connect_once(self, channel_key: str, port: int | None) -> tuple[UdtSession, dict]:
@@ -148,7 +150,9 @@ class WelcomeEyeDevice:
         except RuntimeError as err:
             raise WelcomeEyeError(str(err)) from err
         try:
-            res = session.connect(self.username, self._password, chan=chan, raw_pwd=True)
+            # a port that no longer answers should not cost the full 8 s handshake
+            res = session.connect(self.username, self._password, chan=chan,
+                                  raw_pwd=True, timeout=4.0)
         except OSError as err:
             session.close()
             raise WelcomeEyeError(f"cannot reach {self.host}: {err}") from err
@@ -188,6 +192,11 @@ class WelcomeEyeDevice:
         those bursts and failing for no reason.
         """
         with self._session_lock:
+            remaining = self._backoff_until - time.time()
+            if remaining > 0:
+                raise WelcomeEyeError(
+                    f"not probing the device again for {remaining:.0f}s after the "
+                    f"last discovery failure, so repeated retries cannot starve it")
             port = self.fixed_port or self.punch_port
             if port is not None:
                 _LOGGER.debug("session on %s: trying known port %s", channel_key, port)
@@ -203,8 +212,7 @@ class WelcomeEyeDevice:
             try:
                 port = self._discover_port(discover_window)
             except WelcomeEyeError:
-                if callable(self.on_session_failure):
-                    self.on_session_failure()
+                self._backoff_until = time.time() + FAILURE_BACKOFF
                 raise
             self.punch_port = port
             _LOGGER.info("session on %s: discovered port %s", channel_key, port)

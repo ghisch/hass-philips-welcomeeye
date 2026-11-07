@@ -12,9 +12,10 @@ from .device import WelcomeEyeDevice, WelcomeEyeError
 
 _LOGGER = logging.getLogger(__name__)
 
-#: A probe is a login only - it never starts A/V, so it does not take the channel
-#: away from the indoor monitor. Still no reason to do it often.
-UPDATE_INTERVAL = timedelta(minutes=5)
+#: Every probe is a discovery and a login, and every discovery costs the device a
+#: port allocation. Rarely is right. While a stream is running there is nothing to
+#: learn that the stream is not already proving, so the poll skips itself then.
+UPDATE_INTERVAL = timedelta(minutes=15)
 
 
 class WelcomeEyeCoordinator(DataUpdateCoordinator[dict]):
@@ -25,6 +26,8 @@ class WelcomeEyeCoordinator(DataUpdateCoordinator[dict]):
         self.device = device
 
     async def _async_update_data(self) -> dict:
+        if self.device.stats.streaming and self.data:
+            return self.data
         try:
             return await self.hass.async_add_executor_job(self.device.probe)
         except WelcomeEyeError as err:

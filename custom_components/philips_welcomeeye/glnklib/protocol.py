@@ -159,11 +159,15 @@ def enc_login_frame(gid, user, pwd, chan=0, ver=5, b64=APP_B64, b65=APP_B65,
                 enc_login_tlv(gid, user, pwd, chan, b64, b65, login_id, mask_lo))
 
 # ---------------- discovery ----------------
-def discover(target="255.255.255.255", timeout=6.0, gid=b"", retry_every=1.0):
-    """Probe for devices on UDP 1500.
+def discover(target="255.255.255.255", timeout=9.0, gid=b"", retry_every=3.0):
+    """Probe for devices on UDP 1500. Gently.
 
-    The probe is repeated rather than sent once: it is a single UDP datagram and
-    losing it means a failed setup for no good reason.
+    The device answers every probe when left alone: 180 of 180 over three minutes
+    with nothing else talking to it. Probed continuously - once a second, as a
+    client with a long retry window does - it stops answering for about 90 seconds
+    at a time. Each reply also allocates a fresh UDT port on the device, so a
+    stream of probes is a stream of allocations. Three probes, three seconds
+    apart, is enough to survive a lost datagram without starving the device.
 
     Note the device answers from an EPHEMERAL source port, not from 1500. The
     socket is therefore left unconnected so it accepts a reply from any source -
