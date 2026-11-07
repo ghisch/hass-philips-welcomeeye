@@ -1,5 +1,7 @@
 """GooLink / LangTao 'glnk' OWSP client - reverse engineered from libglnkav.so / libglnkio.so."""
-import struct, random, socket, time
+import logging, struct, random, socket, time
+
+_LOGGER = logging.getLogger(__name__)
 
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
@@ -176,13 +178,18 @@ def discover(target="255.255.255.255", timeout=6.0, gid=b"", retry_every=1.0):
     s.bind(("0.0.0.0", 0))
     single = target not in ("255.255.255.255", "<broadcast>")
     found, seen = [], set()
+    sent = received = unparsed = 0
+    send_error = None
     deadline, last_probe = time.time() + timeout, 0.0
     while time.time() < deadline:
         if time.time() - last_probe >= retry_every:
             try:
                 s.sendto(pkt, (target, 1500))
-            except OSError:
-                pass
+                sent += 1
+            except OSError as err:
+                # never swallow this: a send that always fails looks exactly like
+                # a device that never answers, and sends the search somewhere else
+                send_error = err
             last_probe = time.time()
         try:
             d, a = s.recvfrom(4096)
@@ -190,15 +197,29 @@ def discover(target="255.255.255.255", timeout=6.0, gid=b"", retry_every=1.0):
             continue
         except ConnectionRefusedError:
             continue                      # ICMP unreachable from an earlier probe
+        received += 1
         r = parse_discovery(d)
-        if not r or r["gid"] in seen:
+        if not r:
+            unparsed += 1
+            continue
+        if r["gid"] in seen:
             continue
         seen.add(r["gid"])
         r["from"] = a[0]
         found.append(r)
         if single:
             break                         # asked about one device, and it answered
+    local = None
+    try:
+        local = s.getsockname()
+    except OSError:
+        pass
     s.close()
+    if not found:
+        _LOGGER.warning(
+            "discovery found nothing for %s: %d probes sent, %d datagrams received, "
+            "%d unparsable, local socket %s, send error %r",
+            target, sent, received, unparsed, local, send_error)
     return found
 
 def parse_discovery(d):
