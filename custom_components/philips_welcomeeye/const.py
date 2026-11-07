@@ -34,3 +34,9 @@ CONF_AV_WAIT: Final = "av_wait"
 #: consistently at about 1.3 s. It only bounds how long a doomed attempt waits
 #: before failing, so a few seconds of headroom costs nothing on success.
 DEFAULT_AV_WAIT: Final = 5.0
+
+#: Last punch port that worked, remembered in the config entry. The port is
+#: randomised, so this is a hint and never a guarantee: a session tries it first
+#: and falls back to discovery when it is stale. It makes a restart survive a
+#: discovery probe that goes missing.
+CONF_LAST_PORT: Final = "last_punch_port"

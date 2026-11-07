@@ -91,7 +91,8 @@ class WelcomeEyeDevice:
 
     def __init__(self, host: str, gid: str, username: str, password: str,
                  punch_port: int | None = None,
-                 lock_channel: int = LOCK_CHANNEL_GATE) -> None:
+                 lock_channel: int = LOCK_CHANNEL_GATE,
+                 hint_port: int | None = None) -> None:
         self.host = host
         self.gid = gid
         self.username = username
@@ -100,7 +101,8 @@ class WelcomeEyeDevice:
         #: Normally left unset: the port is randomised and rotates often (observed
         #: moving twice in one evening), so it is rediscovered per connection.
         self.fixed_port = punch_port
-        self.punch_port: int | None = punch_port
+        #: Last port known to work, from the config entry. A hint only.
+        self.punch_port: int | None = punch_port or hint_port
         self.lock_channel = lock_channel
         self.av_wait = AV_WAIT_SECONDS
 
@@ -149,11 +151,11 @@ class WelcomeEyeDevice:
         try:
             return self._connect_once(channel_key, port)
         except WelcomeEyeError:
-            if port is None:
-                raise                       # discovery already ran and failed
-            _LOGGER.debug("port %s stale, rediscovering", port)
+            if port is None or port == self.fixed_port:
+                raise           # discovery already ran, or the user pinned this port
+            _LOGGER.debug("punch port %s is stale, rediscovering", port)
             self.punch_port = None
-            return self._connect_once(channel_key, self.fixed_port)
+            return self._connect_once(channel_key, None)
 
     def _start_av(self, session: UdtSession, channel_key: str) -> None:
         _chan, sel = CHANNEL_MAP[channel_key]

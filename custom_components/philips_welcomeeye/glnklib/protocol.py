@@ -374,7 +374,9 @@ class UdtSession:
     def __init__(self, ip, gid, port=None, verbose=False):
         from .udt import UdtClient
         if port is None:
-            d = discover(ip, timeout=3.0)
+            # use the module default: the probe is retried across the window,
+            # and 3 seconds is thin on a lossy link
+            d = discover(ip)
             if not d:
                 raise RuntimeError(
                     f"{ip} did not answer a discovery probe on UDP 1500. The UDT "
