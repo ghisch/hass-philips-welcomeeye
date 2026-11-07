@@ -56,6 +56,15 @@ DISCOVERY_WINDOW_LONG = 9.0
 DISCOVERY_WINDOW_SHORT = 9.0
 FAILURE_BACKOFF = 30.0
 
+#: A discovered port is short-lived. In the debug log, every port that answered a
+#: handshake 2 to 5 seconds after discovery had stopped answering 37 to 60
+#: seconds later, five times out of five. So a port is reused only while it is
+#: young; otherwise discovery runs again, immediately before connecting.
+PORT_REUSE_SECONDS = 20.0
+#: A burst of handshakes to a dead port right before a probe seemed to cost the
+#: probe its reply. A short pause between the two is cheap insurance.
+SETTLE_AFTER_FAILED_HANDSHAKE = 1.5
+
 
 class WelcomeEyeError(Exception):
     """Something went wrong talking to the device."""
@@ -115,8 +124,10 @@ class WelcomeEyeDevice:
         #: Normally left unset: the port is randomised and rotates often (observed
         #: moving twice in one evening), so it is rediscovered per connection.
         self.fixed_port = punch_port
-        #: Last port known to work, from the config entry. A hint only.
+        #: Last port known to work, from the config entry. A hint only, and only
+        #: trusted while young - see PORT_REUSE_SECONDS.
         self.punch_port: int | None = punch_port or hint_port
+        self._port_time: float = 0.0
         self.lock_channel = lock_channel
         self.av_wait = AV_WAIT_SECONDS
 
@@ -172,11 +183,12 @@ class WelcomeEyeDevice:
         if not found:
             raise WelcomeEyeError(
                 f"{self.host} did not answer a discovery probe on UDP 1500 within "
-                f"{window:.0f}s. This device goes quiet for up to about 90 seconds "
-                f"at a time, so a single failure is usually nothing. If it never "
+                f"{window:.0f}s. It answers reliably when left alone, so a single "
+                f"failure right after other traffic is usually nothing. If it never "
                 f"answers, check that it is powered on, on the same subnet as Home "
                 f"Assistant, and that nothing between them blocks UDP 1500.")
         port = found[0]["port2"]
+        self._port_time = time.time()
         if port != self.punch_port and callable(self.on_port_change):
             self.on_port_change(port)
         return port
@@ -197,18 +209,24 @@ class WelcomeEyeDevice:
                 raise WelcomeEyeError(
                     f"not probing the device again for {remaining:.0f}s after the "
                     f"last discovery failure, so repeated retries cannot starve it")
-            port = self.fixed_port or self.punch_port
+            port = self.fixed_port
+            age = time.time() - self._port_time
+            if port is None and self.punch_port is not None and age < PORT_REUSE_SECONDS:
+                port = self.punch_port
             if port is not None:
-                _LOGGER.debug("session on %s: trying known port %s", channel_key, port)
+                _LOGGER.debug("session on %s: trying port %s (age %.0fs)",
+                              channel_key, port, age)
                 try:
                     return self._connect_once(channel_key, port)
                 except WelcomeEyeError as err:
                     if port == self.fixed_port:
                         raise       # the user pinned this port on purpose
-                    # at WARNING on purpose: this is the step that decides whether
-                    # discovery (and its quiet spells) is needed at all
-                    _LOGGER.warning("known port %s failed (%s); rediscovering with a "
-                                    "%.0fs window", port, err, discover_window)
+                    _LOGGER.warning("port %s failed after %.0fs (%s); rediscovering",
+                                    port, age, err)
+                    time.sleep(SETTLE_AFTER_FAILED_HANDSHAKE)
+            elif self.punch_port is not None:
+                _LOGGER.debug("session on %s: port %s is %.0fs old, discovering afresh",
+                              channel_key, self.punch_port, age)
             try:
                 port = self._discover_port(discover_window)
             except WelcomeEyeError:
@@ -361,13 +379,19 @@ class WelcomeEyeDevice:
         # drop the server so viewers reconnect onto the new channel
         self.stop_stream_server()
 
-    def pump_to(self, write, should_stop) -> None:
-        """Stream MPEG-TS to `write` until `should_stop()`. Runs on its own thread."""
+    def pump_frames(self, on_frame, should_stop) -> None:
+        """Run ONE device session and hand every video frame to `on_frame(payload,
+        pts_90k, keyframe)` until `should_stop()`. Runs on its own thread.
+
+        One session serves every viewer. The device allows one session per
+        discovered port and ports are short-lived, so a session per viewer meant
+        the second viewer - which Home Assistant opens for stills - fought the
+        first for a port and lost.
+        """
         channel_key = self.channel
         session, _res = self._session(channel_key)
         try:
             self._start_av(session, channel_key)
-            mux = TsMuxer(write)
             started, ts0 = False, None
             self.stats.started_at = time.time()
             _LOGGER.info("stream: session up on %s, waiting for a keyframe", channel_key)
@@ -386,7 +410,7 @@ class WelcomeEyeDevice:
                 if ts0 is None:
                     ts0 = ts_ms if ts_ms is not None else 0
                 pts = ((ts_ms - ts0) if ts_ms is not None else 0) * 90
-                mux.write_frame(payload, pts + 90000, keyframe=(kind == "key"))
+                on_frame(payload, pts + 90000, kind == "key")
                 self.stats.frames += 1
                 self.stats.bytes_sent += len(payload)
         finally:
@@ -396,41 +420,45 @@ class WelcomeEyeDevice:
             session.close()
 
 
+class _Viewer:
+    """One TCP client. Gets its own muxer so its continuity counters are its
+    own, and starts receiving at the first keyframe after it joined."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.mux = TsMuxer(sock.sendall)
+        self.started = False
+        self.gone = threading.Event()
+
+
 class _Handler(socketserver.BaseRequestHandler):
-    """One viewer. Opens its own device session and streams until it disconnects."""
+    """Register the viewer, then wait here until it hangs up. Frames are written
+    by the server's pump thread, not by this one."""
 
     def handle(self) -> None:  # noqa: D102
-        device: WelcomeEyeDevice = self.server.device  # type: ignore[attr-defined]
+        server: _TsServer = self.server  # type: ignore[assignment]
+        device = server.device
         if not device.stream_enabled or device._unlocking.is_set():
             return
-        stop = threading.Event()
-        device.stats.clients += 1
-        _LOGGER.info("stream: viewer connected from %s (%d now)",
-                     self.client_address[0], device.stats.clients)
-
-        def write(data: bytes) -> None:
-            self.request.sendall(data)
-
-        def should_stop() -> bool:
-            # yield the channel the moment the gate needs it
-            return stop.is_set() or device._unlocking.is_set()
-
+        viewer = server.add_viewer(self.request)
+        self.request.settimeout(1.0)
         try:
-            device.pump_to(write, should_stop)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass                       # viewer went away, which is the normal exit
-        except Exception as err:       # noqa: BLE001 - surfaced as a diagnostic
-            device.stats.last_error = str(err)
-            _LOGGER.warning("stream failed: %s", err)
+            while not viewer.gone.is_set():
+                try:
+                    if self.request.recv(1) == b"":
+                        break                       # viewer closed the connection
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
         finally:
-            stop.set()
-            device.stats.clients = max(0, device.stats.clients - 1)
-            _LOGGER.info("stream: viewer gone (%d left)", device.stats.clients)
+            server.remove_viewer(viewer)
 
 
 class _TsServer(socketserver.ThreadingTCPServer):
     """Loopback-only MPEG-TS server. Bound to 127.0.0.1 so nothing off-host can
-    reach an unauthenticated video feed."""
+    reach an unauthenticated video feed. Runs a single device session while at
+    least one viewer is connected and fans the frames out to all of them."""
 
     allow_reuse_address = True
     daemon_threads = True
@@ -440,7 +468,12 @@ class _TsServer(socketserver.ThreadingTCPServer):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.port: int = self.socket.getsockname()[1]
         self._thread: threading.Thread | None = None
+        self._viewers: list[_Viewer] = []
+        self._vlock = threading.Lock()
+        self._pump: threading.Thread | None = None
+        self._stopping = False
 
+    # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
         self._thread = threading.Thread(target=self.serve_forever, daemon=True,
                                         name="welcomeeye-ts")
@@ -448,10 +481,76 @@ class _TsServer(socketserver.ThreadingTCPServer):
         _LOGGER.debug("TS server listening on 127.0.0.1:%s", self.port)
 
     def stop(self) -> None:
+        self._stopping = True
+        with self._vlock:
+            for v in self._viewers:
+                v.gone.set()
+            self._viewers.clear()
         self.shutdown()
         self.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+    # --------------------------------------------------------------- viewers
+    def add_viewer(self, sock: socket.socket) -> _Viewer:
+        viewer = _Viewer(sock)
+        with self._vlock:
+            self._viewers.append(viewer)
+            self.device.stats.clients = len(self._viewers)
+            _LOGGER.info("stream: viewer connected (%d now)", len(self._viewers))
+            if self._pump is None or not self._pump.is_alive():
+                self._pump = threading.Thread(target=self._run_pump, daemon=True,
+                                              name="welcomeeye-pump")
+                self._pump.start()
+        return viewer
+
+    def remove_viewer(self, viewer: _Viewer) -> None:
+        with self._vlock:
+            if viewer in self._viewers:
+                self._viewers.remove(viewer)
+            viewer.gone.set()
+            self.device.stats.clients = len(self._viewers)
+            _LOGGER.info("stream: viewer gone (%d left)", len(self._viewers))
+
+    def _drop_all(self) -> None:
+        """The session died: let every viewer go so Home Assistant reconnects."""
+        with self._vlock:
+            for v in self._viewers:
+                v.gone.set()
+            self._viewers.clear()
+            self.device.stats.clients = 0
+
+    # ------------------------------------------------------------------ pump
+    def _should_stop(self) -> bool:
+        with self._vlock:
+            empty = not self._viewers
+        return empty or self._stopping or self.device._unlocking.is_set()
+
+    def _on_frame(self, payload, pts: int, keyframe: bool) -> None:
+        with self._vlock:
+            viewers = list(self._viewers)
+        for v in viewers:
+            if v.gone.is_set():
+                continue
+            if not v.started:
+                if not keyframe:
+                    continue                    # join at a keyframe, never mid-GOP
+                v.started = True
+            try:
+                v.mux.write_frame(payload, pts, keyframe=keyframe)
+            except OSError:
+                self.remove_viewer(v)
+
+    def _run_pump(self) -> None:
+        try:
+            self.device.pump_frames(self._on_frame, self._should_stop)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as err:        # noqa: BLE001 - surfaced as a diagnostic
+            self.device.stats.last_error = str(err)
+            _LOGGER.warning("stream failed: %s", err)
+        finally:
+            self._drop_all()
 
 
 def locate_punch_port(host: str) -> list[int]:
