@@ -22,10 +22,12 @@ documents the wire format in its docstrings.
 
 ## Three device behaviours worth knowing
 
-**The device serves one channel at a time, and whoever got there first keeps it.**
-A stream held open by Home Assistant takes the picture away from your indoor
-monitor. That is why the stream switch exists and why it defaults to off. Nothing
-touches the device until you enable it, and then only while something is watching.
+**The device serves one channel at a time.** While Home Assistant streams, the
+indoor monitor shows a phone icon instead of the picture. The monitor can still take
+the picture back: a swipe on it starts its own view and cuts the Home Assistant
+stream. So the stream switch is a courtesy, not a lock. It defaults to off, and
+nothing touches the device until you enable it, and then only while something is
+watching.
 
 **The gate needs live video on the door channel.** Without it the device accepts the
 command and does nothing. The integration waits for door video and refuses to send
