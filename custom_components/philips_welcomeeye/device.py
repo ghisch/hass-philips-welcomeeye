@@ -170,6 +170,9 @@ class WelcomeEyeDevice:
         self._lock_rsp_event = threading.Event()
         #: Called with a new port so it can be persisted. Set by the integration.
         self.on_port_change: object = None
+        #: Called after the camera source changed, so the camera entity can make
+        #: Home Assistant restart its stream at once instead of on its own retry.
+        self.on_channel_change: object = None
         #: Set after a discovery failure. Until it passes, session attempts fail
         #: at once instead of probing again - Home Assistant retries a camera
         #: stream every few seconds, and each retry must not cost the device.
@@ -429,7 +432,19 @@ class WelcomeEyeDevice:
     def set_stream_enabled(self, enabled: bool) -> None:
         self.stream_enabled = enabled
         if not enabled:
-            self.stop_stream_server()
+            self._drop_viewers()
+
+    def _drop_viewers(self) -> None:
+        """End the device session but keep the listening port.
+
+        Home Assistant's stream worker remembers the URL it was given and keeps
+        retrying it; it does not ask for a new one. A server that goes away takes
+        its port with it, and the worker then retries a dead port for good. That
+        is what "stuck after switching camera" was.
+        """
+        with self._lock:
+            if self._server is not None:
+                self._server.drop_viewers(join=True)
 
     def set_channel(self, channel: str) -> None:
         if channel not in CHANNEL_MAP:
@@ -437,10 +452,12 @@ class WelcomeEyeDevice:
         if channel == self.channel:
             return
         self.channel = channel
-        # drop the server so viewers reconnect onto the new channel; stop() waits
-        # for the old session to close first, or the new channel gets no video
         _LOGGER.info("camera source -> %s", channel)
-        self.stop_stream_server()
+        # end the old session first - the device serves one channel at a time and
+        # the incumbent keeps it - then let viewers reconnect to the SAME port
+        self._drop_viewers()
+        if callable(self.on_channel_change):
+            self.on_channel_change()
 
     def pump_frames(self, on_frame, should_stop) -> None:
         """Run ONE device session and hand every video frame to `on_frame(payload,
@@ -603,6 +620,16 @@ class _TsServer(socketserver.ThreadingTCPServer):
                 v.gone.set()
             self._viewers.clear()
             self.device.stats.clients = 0
+
+    def drop_viewers(self, join: bool = False) -> None:
+        """Disconnect every viewer and end the session; keep listening."""
+        self._drop_all()
+        pump = self._pump
+        if join and pump is not None and pump.is_alive() \
+                and pump is not threading.current_thread():
+            pump.join(timeout=6)
+            if pump.is_alive():
+                _LOGGER.warning("stream: previous session did not close in time")
 
     # ------------------------------------------------------------------ pump
     def _should_stop(self) -> bool:

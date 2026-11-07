@@ -37,6 +37,27 @@ class WelcomeEyeCamera(WelcomeEyeEntity, Camera):
         Camera.__init__(self)
         self._attr_unique_id = f"{device.gid}_camera"
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._device.on_channel_change = lambda: self.hass.add_job(self._async_restart_stream)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._device.on_channel_change = None
+        await super().async_will_remove_from_hass()
+
+    async def _async_restart_stream(self) -> None:
+        """The source changed under a running stream: make the worker reconnect
+        now rather than on its own back-off, which can be a minute."""
+        if self.stream is None:
+            return
+        source = await self.stream_source()
+        if source:
+            try:
+                self.stream.update_source(source)
+            except Exception as err:  # noqa: BLE001 - best effort, worker retries anyway
+                _LOGGER.debug("could not restart the stream: %s", err)
+        self.async_write_ha_state()
+
     @property
     def use_stream_for_stills(self) -> bool:
         """Take stills from the stream rather than opening a second session.
