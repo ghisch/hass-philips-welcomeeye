@@ -29,8 +29,8 @@ from .const import (CHANNEL_CAM, CHANNEL_DOOR, DEFAULT_STREAM_ENABLED,
 from .glnklib.commands import (AV_CAM, AV_DOOR, TLV_LOCK_REQ_ENC, TLV_PRIVATE_REQ,
                                TLV_START_AV_ENC, lock_body, parse_lock_rsp, priv_body,
                                start_av_body, unwrap_priv_rsp, wrap_priv, wrap_cmd)
-from .glnklib.protocol import (CH_CAM, CH_DOOR, RESULT_CODES, UdtSession, find_punch_port,
-                               tlv)
+from .glnklib.protocol import (CH_CAM, CH_DOOR, RESULT_CODES, UdtSession, discover,
+                               find_punch_port, tlv)
 from .glnklib.tsmux import TsMuxer
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,6 +43,11 @@ PRIV_INFO_TLV = 469          # asking this returns the device's version JSON
 
 #: how long to wait for door video before deciding an unlock cannot work
 AV_WAIT_SECONDS = 10.0
+
+#: The device stops answering discovery for 10 to 15 seconds at a time. Measured by
+#: probing once a second for two minutes: twelve seconds of silence, then 84 replies
+#: in a row. A window shorter than that turns a normal quiet spell into a failure.
+DISCOVERY_WINDOW = 25.0
 
 
 class WelcomeEyeError(Exception):
@@ -118,6 +123,9 @@ class WelcomeEyeDevice:
         #: because the unlock needs the door channel and the device only serves one.
         self._unlocking = threading.Event()
         self._unlock_lock = threading.Lock()
+        #: One session setup at a time. Several stream viewers arriving together
+        #: must not each run their own discovery.
+        self._session_lock = threading.Lock()
 
     # ------------------------------------------------------------------ session
     def _connect_once(self, channel_key: str, port: int | None) -> tuple[UdtSession, dict]:
@@ -140,22 +148,39 @@ class WelcomeEyeDevice:
         self.punch_port = session.port
         return session, res
 
+    def _discover_port(self) -> int:
+        """Ask the device which UDT port to use, patiently."""
+        found = discover(self.host, timeout=DISCOVERY_WINDOW)
+        if not found:
+            raise WelcomeEyeError(
+                f"{self.host} did not answer a discovery probe on UDP 1500 within "
+                f"{DISCOVERY_WINDOW:.0f}s. The device stops answering for short "
+                f"spells, so this is usually transient. Check that it is powered "
+                f"on, on the same subnet as Home Assistant, and that nothing "
+                f"between them blocks UDP 1500.")
+        return found[0]["port2"]
+
     def _session(self, channel_key: str) -> tuple[UdtSession, dict]:
         """Log in on the channel's own mask. Caller must close the session.
 
-        The punch port rotates - observed changing twice in one evening - so a
-        cached value goes stale and the handshake simply times out. On failure,
-        forget it and let discovery find the current one before giving up.
+        A known port is tried before discovery, and that order matters. The port
+        outlives a session and stays usable for minutes, while discovery goes
+        quiet in bursts; rediscovering on every session meant landing in one of
+        those bursts and failing for no reason.
         """
-        port = self.fixed_port or self.punch_port
-        try:
+        with self._session_lock:
+            port = self.fixed_port or self.punch_port
+            if port is not None:
+                try:
+                    return self._connect_once(channel_key, port)
+                except WelcomeEyeError as err:
+                    if port == self.fixed_port:
+                        raise       # the user pinned this port on purpose
+                    _LOGGER.debug("punch port %s did not work (%s), rediscovering",
+                                  port, err)
+            port = self._discover_port()
+            self.punch_port = port
             return self._connect_once(channel_key, port)
-        except WelcomeEyeError:
-            if port is None or port == self.fixed_port:
-                raise           # discovery already ran, or the user pinned this port
-            _LOGGER.debug("punch port %s is stale, rediscovering", port)
-            self.punch_port = None
-            return self._connect_once(channel_key, None)
 
     def _start_av(self, session: UdtSession, channel_key: str) -> None:
         _chan, sel = CHANNEL_MAP[channel_key]
